@@ -20,6 +20,9 @@
 #include "thirdparty.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <map>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -133,7 +136,43 @@ struct ReceiverSelection {
 	IClient* client = nullptr;
 	int effect = AudioEffects::EFF_NONE;
 	bool proximity = false;
+	bool directProximity = false; // mode d'origine (si la voix redirigée n'a pas pu être encodée)
+	int slot = 0;                 // joueur au nom duquel la voix est envoyée
+	int sourceUserId = 0;         // 0 = pas de redirection
+	uint64_t steamId = 0;
 };
+
+double NowSeconds() {
+	using namespace std::chrono;
+	return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
+}
+
+IClient* FindClientByUserId(IServer* server, int userId) {
+	const int count = server->GetClientCount();
+	for (int i = 0; i < count; ++i) {
+		IClient* c = server->GetClient(i);
+		if (c != nullptr && c->IsActive() && c->GetUserID() == userId) return c;
+	}
+	return nullptr;
+}
+
+bool HasRedirectForSpeaker(int speakerUserId) {
+	const uint32_t target = static_cast<uint32_t>(speakerUserId);
+	for (const auto& route : g_eightbit->redirects) {
+		if (static_cast<uint32_t>(route.first & 0xFFFFFFFFu) == target) return true;
+	}
+	return false;
+}
+
+EffectEncoderStream& RedirectEncoderStream(SpeakerVoiceState& speaker, int effectId, int sourceUserId) {
+	const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(effectId)) << 32) | static_cast<uint32_t>(sourceUserId);
+	auto found = speaker.redirectEncoders.find(key);
+	if (found == speaker.redirectEncoders.end()) {
+		std::unique_ptr<EffectEncoderStream> created(new EffectEncoderStream());
+		found = speaker.redirectEncoders.emplace(key, std::move(created)).first;
+	}
+	return *found->second;
+}
 
 bool BroadcastRouted(IClient* speakerClient, int nBytes, char* originalData) {
 	if (speakerClient == nullptr || nBytes < static_cast<int>(STEAM_PACKET_OVERHEAD)
@@ -158,6 +197,24 @@ bool BroadcastRouted(IClient* speakerClient, int nBytes, char* originalData) {
 		selected.client = receiver;
 		selected.effect = EffectForReceiver(receiver->GetUserID(), speakerUserId, speaker.defaultEffect);
 		selected.proximity = receiver->IsProximityHearingClient(speakerSlot);
+		selected.slot = speakerSlot;
+		selected.directProximity = selected.proximity;
+
+		// redirection 3D : seulement si le porteur de la radio ne parle pas lui-même à cet instant
+		// (sinon ses paquets et les nôtres se mélangeraient dans le même canal de voix chez l'auditeur)
+		const auto redirect = g_eightbit->redirects.find(EightbitState::RouteKey(receiver->GetUserID(), speakerUserId));
+		if (redirect != g_eightbit->redirects.end()) {
+			IClient* source = FindClientByUserId(server, redirect->second.sourceUserId);
+			const auto spoke = g_eightbit->lastVoice.find(redirect->second.sourceUserId);
+			const bool sourceTalking = spoke != g_eightbit->lastVoice.end() && NowSeconds() - spoke->second < 0.35;
+			if (source != nullptr && source != receiver && source != speakerClient && !sourceTalking) {
+				selected.slot = source->GetPlayerSlot();
+				selected.proximity = true;
+				selected.sourceUserId = redirect->second.sourceUserId;
+				selected.steamId = redirect->second.sourceSteamId;
+				needsModifiedAudio = true;
+			}
+		}
 
 		AudioEffects::Preset check;
 		if (selected.effect != AudioEffects::EFF_NONE && !ResolvePreset(selected.effect, check)) {
@@ -169,7 +226,7 @@ bool BroadcastRouted(IClient* speakerClient, int nBytes, char* originalData) {
 
 	if (receivers.empty()) return true;
 
-	std::unordered_map<int, std::vector<char>> encoded;
+	std::map<std::pair<int, int>, std::vector<char>> encoded;   // (effet, source redirigée)
 	if (needsModifiedAudio) {
 		std::vector<char> pcm(AUDIO_BUFFER_BYTES);
 		const int decodedBytes = SteamVoice::DecompressIntoBuffer(speaker.decoder.get(), originalData, nBytes,
@@ -177,23 +234,31 @@ bool BroadcastRouted(IClient* speakerClient, int nBytes, char* originalData) {
 		if (decodedBytes <= 0 || (decodedBytes & 1) != 0) return false;
 
 		for (const ReceiverSelection& selected : receivers) {
-			if (selected.effect == AudioEffects::EFF_NONE || encoded.find(selected.effect) != encoded.end()) continue;
+			const std::pair<int, int> variantKey(selected.effect, selected.sourceUserId);
+			if ((selected.effect == AudioEffects::EFF_NONE && selected.sourceUserId == 0)
+				|| encoded.find(variantKey) != encoded.end()) continue;
 
 			AudioEffects::Preset preset;
-			if (!ResolvePreset(selected.effect, preset)) continue;
+			const bool hasPreset = selected.effect != AudioEffects::EFF_NONE && ResolvePreset(selected.effect, preset);
+			if (!hasPreset && selected.sourceUserId == 0) continue;
 			std::vector<char> effected(pcm.begin(), pcm.begin() + decodedBytes);
-			EffectEncoderStream& stream = EncoderStream(speaker, selected.effect);
-			AudioEffects::ApplyPreset(preset, reinterpret_cast<int16_t*>(effected.data()), decodedBytes / 2,
-				24000, stream.runtime);
+			EffectEncoderStream& stream = selected.sourceUserId != 0
+				? RedirectEncoderStream(speaker, selected.effect, selected.sourceUserId)
+				: EncoderStream(speaker, selected.effect);
+			if (hasPreset) {
+				AudioEffects::ApplyPreset(preset, reinterpret_cast<int16_t*>(effected.data()), decodedBytes / 2,
+					24000, stream.runtime);
+			}
 
 			std::vector<char> packet(AUDIO_BUFFER_BYTES);
 			uint64_t steamId = 0;
 			std::memcpy(&steamId, originalData, sizeof(steamId));
+			if (selected.sourceUserId != 0 && selected.steamId != 0) steamId = selected.steamId;
 			const int written = SteamVoice::CompressIntoBuffer(steamId, stream.codec.get(), effected.data(), decodedBytes,
 				packet.data(), static_cast<int>(packet.size()), 24000);
 			if (written > 0 && written <= MAX_VOICE_PACKET_BYTES) {
 				packet.resize(static_cast<size_t>(written));
-				encoded.emplace(selected.effect, std::move(packet));
+				encoded.emplace(variantKey, std::move(packet));
 			}
 		}
 	}
@@ -201,14 +266,19 @@ bool BroadcastRouted(IClient* speakerClient, int nBytes, char* originalData) {
 	for (const ReceiverSelection& selected : receivers) {
 		const char* sendData = originalData;
 		int sendBytes = nBytes;
-		if (selected.effect != AudioEffects::EFF_NONE) {
-			const auto variant = encoded.find(selected.effect);
+		int fromSlot = speakerSlot;
+		bool proximity = selected.proximity;
+		if (selected.effect != AudioEffects::EFF_NONE || selected.sourceUserId != 0) {
+			const auto variant = encoded.find(std::pair<int, int>(selected.effect, selected.sourceUserId));
 			if (variant != encoded.end()) {
 				sendData = variant->second.data();
 				sendBytes = static_cast<int>(variant->second.size());
+				fromSlot = selected.slot;
+			} else if (selected.sourceUserId != 0) {
+				proximity = selected.directProximity;   // repli : voix d'origine, au nom de l'émetteur
 			}
 		}
-		VoiceNetMessage message(speakerSlot, selected.proximity, sendData, sendBytes);
+		VoiceNetMessage message(fromSlot, proximity, sendData, sendBytes);
 		selected.client->SendNetMsg(message, false);
 	}
 
@@ -234,10 +304,11 @@ extern "C" void HookBroadcastVoice(IClient* client, int nBytes, char* data, int6
 	}
 
 	const int speakerUserId = client->GetUserID();
+	g_eightbit->lastVoice[speakerUserId] = NowSeconds();
 	const auto speaker = g_eightbit->speakers.find(speakerUserId);
 	const int defaultEffect = speaker == g_eightbit->speakers.end()
 		? AudioEffects::EFF_NONE : speaker->second->defaultEffect;
-	if (defaultEffect == AudioEffects::EFF_NONE && !HasRouteForSpeaker(speakerUserId)) {
+	if (defaultEffect == AudioEffects::EFF_NONE && !HasRouteForSpeaker(speakerUserId) && !HasRedirectForSpeaker(speakerUserId)) {
 		return original(client, nBytes, data, xuid);
 	}
 
@@ -251,6 +322,13 @@ void RemoveRoutesForPlayer(int userId) {
 		if (listener == userId || speaker == userId) it = g_eightbit->receiverEffects.erase(it);
 		else ++it;
 	}
+	for (auto it = g_eightbit->redirects.begin(); it != g_eightbit->redirects.end();) {
+		const int listener = static_cast<int>(static_cast<uint32_t>(it->first >> 32));
+		const int speaker = static_cast<int>(static_cast<uint32_t>(it->first & 0xFFFFFFFFu));
+		if (listener == userId || speaker == userId || it->second.sourceUserId == userId) it = g_eightbit->redirects.erase(it);
+		else ++it;
+	}
+	g_eightbit->lastVoice.erase(userId);
 	g_eightbit->speakers.erase(userId);
 }
 
@@ -358,6 +436,7 @@ LUA_FUNCTION_STATIC(eightbit_clear_player) { RemoveRoutesForPlayer(static_cast<i
 
 LUA_FUNCTION_STATIC(eightbit_clear_all_routes) {
 	g_eightbit->receiverEffects.clear();
+	g_eightbit->redirects.clear();
 	for (auto it = g_eightbit->speakers.begin(); it != g_eightbit->speakers.end();) {
 		if (it->second->defaultEffect == AudioEffects::EFF_NONE) it = g_eightbit->speakers.erase(it);
 		else ++it;
@@ -454,7 +533,29 @@ LUA_FUNCTION_STATIC(eightbit_is_valid_preset) {
 
 LUA_FUNCTION_STATIC(eightbit_get_preset_directory) { LUA->PushString(g_eightbit->presets.Directory().c_str()); return 1; }
 LUA_FUNCTION_STATIC(eightbit_is_hook_available) { LUA->PushBool(g_voiceHookAvailable); return 1; }
-LUA_FUNCTION_STATIC(eightbit_get_version) { LUA->PushString("2.0.2-fbradio1"); return 1; }
+LUA_FUNCTION_STATIC(eightbit_get_version) { LUA->PushString("2.0.2-fbradio2"); return 1; }
+
+// FB Radio : SetReceiverSource(auditeur, émetteur, source, steamid64 de la source) -> la voix de l'émetteur
+// arrive chez l'auditeur au nom de la source, en 3D (elle sort de la radio de la source)
+LUA_FUNCTION_STATIC(eightbit_set_receiver_source) {
+	const int listener = static_cast<int>(LUA->GetNumber(1));
+	const int speaker = static_cast<int>(LUA->GetNumber(2));
+	const int source = static_cast<int>(LUA->GetNumber(3));
+	uint64_t steamId = 0;
+	if (LUA->GetType(4) == GarrysMod::Lua::Type::String) steamId = std::strtoull(LUA->GetString(4), nullptr, 10);
+	if (listener <= 0 || speaker <= 0 || source <= 0 || source == speaker || source == listener) { LUA->PushBool(false); return 1; }
+	EightbitState::Redirect r;
+	r.sourceUserId = source;
+	r.sourceSteamId = steamId;
+	g_eightbit->redirects[EightbitState::RouteKey(listener, speaker)] = r;
+	LUA->PushBool(true);
+	return 1;
+}
+LUA_FUNCTION_STATIC(eightbit_clear_receiver_source) {
+	g_eightbit->redirects.erase(EightbitState::RouteKey(static_cast<int>(LUA->GetNumber(1)), static_cast<int>(LUA->GetNumber(2))));
+	return 0;
+}
+LUA_FUNCTION_STATIC(eightbit_has_voice_redirect) { LUA->PushBool(true); return 1; }
 LUA_FUNCTION_STATIC(eightbit_has_radio_model) { LUA->PushBool(true); return 1; }   // FB Radio : radio_model=1 disponible
 
 GMOD_MODULE_OPEN() {
@@ -522,6 +623,9 @@ GMOD_MODULE_OPEN() {
 	AddFunction(LUA, "EnableEffect", eightbit_enable_effect);
 	AddFunction(LUA, "SetReceiverEffect", eightbit_set_receiver_effect);
 	AddFunction(LUA, "HasRadioModel", eightbit_has_radio_model);
+	AddFunction(LUA, "SetReceiverSource", eightbit_set_receiver_source);
+	AddFunction(LUA, "ClearReceiverSource", eightbit_clear_receiver_source);
+	AddFunction(LUA, "HasVoiceRedirect", eightbit_has_voice_redirect);
 	AddFunction(LUA, "SetShouldHearEffect", eightbit_set_should_hear_effect);
 	AddFunction(LUA, "ClearReceiverEffect", eightbit_clear_receiver_effect);
 	AddFunction(LUA, "GetReceiverEffect", eightbit_get_receiver_effect);

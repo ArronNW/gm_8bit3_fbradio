@@ -297,7 +297,7 @@ inline void Process(const Preset& p, int16_t* audio, int samples, int sampleRate
 		const bool speaking = st.envelope > gateTh * 2.0f;
 
 		// 1. bande du haut-parleur (coupe-bas raide) + égalisation
-		for (int k = 0; k < st.hpStages; ++k) x = Run(st.hp[k], x);
+		for (int j = 0; j < st.hpStages; ++j) x = Run(st.hp[j], x);
 		x = Run(st.eqLow, x);
 		x = Run(st.eqPresence, x);
 
@@ -332,7 +332,7 @@ inline void Process(const Preset& p, int16_t* audio, int samples, int sampleRate
 		if (bits > 0) x = MuLaw(x, bits);
 
 		// 7. coupe-haut raide : bande d'une radio numérique (~8 kHz d'échantillonnage)
-		for (int k = 0; k < st.lpStages; ++k) x = Run(st.lp[k], x);
+		for (int j = 0; j < st.lpStages; ++j) x = Run(st.lp[j], x);
 
 		// 8. porte : silence entre les mots, comme une radio numérique
 		const float g = st.envelope >= gateTh ? 1.0f : 0.0f;
