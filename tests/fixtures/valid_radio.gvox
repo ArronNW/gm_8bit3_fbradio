@@ -1,0 +1,13 @@
+version=1
+name=Parser test radio
+description=Regression fixture for the server-side preset parser.
+key=parser_test_radio
+gain=99
+highpass_hz=650
+lowpass_hz=3500
+drive=1.4
+clip=0.8
+noise=0.01
+quantize=240
+downsample=99
+soft_clip=true
