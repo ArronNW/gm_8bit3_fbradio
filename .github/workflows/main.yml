@@ -1,0 +1,42 @@
+name: Build gmsv_eightbit (FB Radio)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fichiers a la racine
+        shell: pwsh
+        run: |
+          if (-not (Test-Path premake5.lua)) {
+            $p = Get-ChildItem -Recurse -Filter premake5.lua | Select-Object -First 1
+            Copy-Item -Path (Join-Path $p.DirectoryName '*') -Destination . -Recurse -Force
+          }
+          Get-ChildItem
+      - uses: actions/checkout@v4
+        with:
+          repository: danielga/garrysmod_common
+          ref: x86-64-support-sourcesdk
+          path: garrysmod_common
+          submodules: recursive
+      - name: Premake
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/premake/premake-core/releases/download/v5.0.0-beta7/premake-5.0.0-beta7-windows.zip -OutFile premake.zip
+          Expand-Archive premake.zip -DestinationPath premake-bin
+          ./premake-bin/premake5.exe --gmcommon=garrysmod_common vs2022
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build x86 + x64
+        shell: pwsh
+        run: |
+          msbuild projects/windows/vs2022/eightbit.sln /m /p:Configuration=Release /p:Platform=Win32
+          msbuild projects/windows/vs2022/eightbit.sln /m /p:Configuration=Release /p:Platform=x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gmsv_eightbit_windows
+          path: projects/windows/vs2022/**/gmsv_eightbit_win*.dll
+          if-no-files-found: error
